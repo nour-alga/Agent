@@ -2,9 +2,7 @@
 .env
 *.env
 
-# PDFs — données confidentielles, ne pas versionner
-pdfs/
-*.pdf
+
 
 # Rapports générés
 output/
