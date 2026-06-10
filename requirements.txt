@@ -1,0 +1,2 @@
+anthropic>=0.40.0
+pymupdf4llm>=0.0.17

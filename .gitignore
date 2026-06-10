@@ -1,0 +1,28 @@
+# Clé API — ne jamais commiter
+.env
+*.env
+
+# PDFs — données confidentielles, ne pas versionner
+pdfs/
+*.pdf
+
+# Rapports générés
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
