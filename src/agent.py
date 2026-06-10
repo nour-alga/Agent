@@ -6,21 +6,22 @@ Sortie  : rapport Markdown structuré style expertise CSE cabinet haut de gamme
 
 import os
 import sys
+import time
+import base64
 import anthropic
-import pymupdf4llm
+import markdown as md_lib
+from weasyprint import HTML
 from pathlib import Path
 from datetime import date
 from dotenv import load_dotenv
 
-load_dotenv()  # charge automatiquement le fichier .env
+load_dotenv()
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 MODEL         = "claude-sonnet-4-6"
 MAX_TOKENS    = 8000
-TOKEN_LIMIT   = 150_000   # seuil d'alerte (200k = limite absolue du modèle)
-CHARS_PER_TOK = 4         # estimation grossière : 1 token ≈ 4 caractères
 
-# ── Prompt système (ton prompt docx intégral) ──────────────────────────────────
+# ── Prompt système ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Tu es un expert CSE senior spécialisé en analyse économique, financière et sociale des entreprises, avec une expérience équivalente à un cabinet de conseil haut de gamme.
 
 Ta mission est de produire un rapport d'expertise CSE complet, structuré, pédagogique et stratégique, destiné à des élus du Comité Social et Économique.
@@ -95,14 +96,10 @@ STYLE RÉDACTIONNEL
 - utiliser des tableaux Markdown pour toutes les données chiffrées
 - signaler les alertes avec ⚠"""
 
-# ── Prompt utilisateur (structure du rapport) ──────────────────────────────────
-RAPPORT_PROMPT = """Voici les comptes sociaux de l'entreprise sur 3 exercices consécutifs.
+# ── Prompt utilisateur ─────────────────────────────────────────────────────────
+RAPPORT_PROMPT = """Voici les comptes sociaux de l'entreprise sur 3 exercices consécutifs (PDFs joints).
 
-{annee_sections}
-
----
-
-Génère un rapport d'expertise CSE complet structuré en slides selon le plan suivant :
+Génère un rapport d'expertise CSE complet structuré selon le plan suivant :
 
 ---
 
@@ -115,7 +112,7 @@ Génère un rapport d'expertise CSE complet structuré en slides selon le plan s
 ---
 
 ## 2. ANALYSE DE L'ACTIVITÉ DÉTAILLÉE
-- Évolution du chiffre d'affaires (tableau détaillé N / N-1 / N-2 avec variations €  et %)
+- Évolution du chiffre d'affaires (tableau détaillé N / N-1 / N-2 avec variations € et %)
 - Analyse des données analytiques si disponibles
 - Analyse des variations (volume, prix, clients)
 - Dépendance économique
@@ -206,54 +203,168 @@ Date du rapport : {today}
 Document strictement confidentiel — réservé aux membres du CSE"""
 
 
-# ── Conversion PDF → Markdown ──────────────────────────────────────────────────
-def pdf_to_markdown(pdf_path: str) -> str:
-    """Convertit un PDF en Markdown propre via pymupdf4llm."""
-    print(f"  📄 Conversion : {Path(pdf_path).name}")
-    md = pymupdf4llm.to_markdown(pdf_path)
-    print(f"     → {len(md):,} caractères | ~{len(md)//CHARS_PER_TOK:,} tokens estimés")
-    return md
+# ── Chargement PDF en base64 ───────────────────────────────────────────────────
+def load_pdf_base64(pdf_path: str) -> str:
+    """Lit un PDF et le encode en base64 pour l'API Anthropic."""
+    print(f"  📄 Chargement : {Path(pdf_path).name} ({Path(pdf_path).stat().st_size / 1024 / 1024:.1f} MB)")
+    with open(pdf_path, "rb") as f:
+        return base64.standard_b64encode(f.read()).decode("utf-8")
 
 
-def estimate_tokens(text: str) -> int:
-    return len(text) // CHARS_PER_TOK
-
-
-def check_token_budget(sections: dict) -> None:
-    """Alerte si le total dépasse le seuil recommandé."""
-    total_chars = sum(len(v) for v in sections.values())
-    total_tokens = estimate_tokens(total_chars)
-    print(f"\n📊 Budget tokens estimé : {total_tokens:,} / {TOKEN_LIMIT:,} recommandés")
-    if total_tokens > TOKEN_LIMIT:
-        print("  ⚠  Dépassement probable — envisage de tronquer les annexes longues")
-    else:
-        print("  ✅ Dans les limites — envoi direct possible")
-
-
-# ── Construction du prompt utilisateur ────────────────────────────────────────
-def build_user_prompt(markdowns: dict) -> str:
-    sections = "\n\n".join(
-        f"## Comptes sociaux — Exercice {annee}\n\n{md}"
-        for annee, md in markdowns.items()
-    )
-    return RAPPORT_PROMPT.format(
-        annee_sections=sections,
-        today=date.today().strftime("%d/%m/%Y")
-    )
-
-
-# ── Appel API Anthropic ────────────────────────────────────────────────────────
-def generate_report(user_prompt: str) -> str:
+# ── Appel API Anthropic avec PDFs natifs ───────────────────────────────────────
+def generate_report(pdf_paths: list) -> str:
+    """
+    Envoie les 3 PDFs directement à Claude via l'API — exactement comme
+    le chat Claude.ai — Claude gère lui-même la lecture, l'OCR si nécessaire,
+    et l'extraction des données.
+    """
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    print(f"\n🤖 Envoi à {MODEL}…")
+
+    # Construction du contenu : 3 PDFs + le prompt
+    content = []
+
+    annees = ["Exercice N-2 (le plus ancien)", "Exercice N-1", "Exercice N (le plus récent)"]
+    for annee, path in zip(annees, pdf_paths):
+        content.append({
+            "type": "text",
+            "text": f"--- {annee} ---"
+        })
+        content.append({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": load_pdf_base64(path)
+            }
+        })
+
+    # Ajout du prompt de génération
+    content.append({
+        "type": "text",
+        "text": RAPPORT_PROMPT.format(today=date.today().strftime("%d/%m/%Y"))
+    })
+
+    print(f"\n🤖 Envoi à {MODEL} (3 PDFs joints)…")
     response = client.messages.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_prompt}]
+        messages=[{"role": "user", "content": content}]
     )
     return response.content[0].text
 
+
+
+# ── CSS du rapport PDF ────────────────────────────────────────────────────────
+PDF_CSS = """
+@page {
+    size: A4;
+    margin: 20mm 18mm 20mm 18mm;
+    @bottom-center {
+        content: "Document confidentiel — CSE — Page " counter(page) " / " counter(pages);
+        font-size: 8pt;
+        color: #888;
+    }
+}
+body {
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 10pt;
+    line-height: 1.6;
+    color: #1a1a1a;
+}
+h1 {
+    font-size: 18pt;
+    color: #1a3a5c;
+    border-bottom: 3px solid #1a3a5c;
+    padding-bottom: 6px;
+    margin-top: 30px;
+}
+h2 {
+    font-size: 13pt;
+    color: #1a3a5c;
+    border-left: 4px solid #e85d24;
+    padding-left: 8px;
+    margin-top: 20px;
+}
+h3 {
+    font-size: 11pt;
+    color: #333;
+    margin-top: 14px;
+}
+table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 8.5pt;
+}
+th {
+    background-color: #1a3a5c;
+    color: white;
+    padding: 6px 8px;
+    text-align: left;
+    font-weight: bold;
+}
+td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #dde;
+}
+tr:nth-child(even) td {
+    background-color: #f5f7fa;
+}
+blockquote {
+    background: #fff8e1;
+    border-left: 4px solid #f9a825;
+    padding: 8px 12px;
+    margin: 10px 0;
+    font-size: 9pt;
+    color: #555;
+}
+code {
+    background: #f4f4f4;
+    padding: 1px 4px;
+    border-radius: 3px;
+    font-size: 8.5pt;
+}
+strong {
+    color: #1a1a1a;
+}
+p { margin: 6px 0; }
+ul, ol { margin: 6px 0; padding-left: 20px; }
+li { margin: 3px 0; }
+hr { border: none; border-top: 1px solid #ccc; margin: 16px 0; }
+.page-break { page-break-after: always; }
+"""
+
+# ── Conversion Markdown → PDF ──────────────────────────────────────────────────
+def markdown_to_pdf(md_path: str) -> str:
+    """Convertit le rapport Markdown en PDF professionnel."""
+    print(f"\n📄 Conversion en PDF…")
+    
+    md_content = Path(md_path).read_text(encoding="utf-8")
+    
+    # Conversion Markdown → HTML
+    html_content = md_lib.markdown(
+        md_content,
+        extensions=["tables", "fenced_code", "nl2br"]
+    )
+    
+    # HTML complet avec CSS
+    full_html = f"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <style>{PDF_CSS}</style>
+</head>
+<body>
+{html_content}
+</body>
+</html>"""
+    
+    # Génération PDF
+    pdf_path = md_path.replace(".md", ".pdf")
+    HTML(string=full_html).write_pdf(pdf_path)
+    print(f"✅ PDF généré : {pdf_path}")
+    return pdf_path
 
 # ── Sauvegarde du rapport ──────────────────────────────────────────────────────
 def save_report(rapport: str, output_dir: str = "output") -> str:
@@ -265,39 +376,57 @@ def save_report(rapport: str, output_dir: str = "output") -> str:
     return str(output_path)
 
 
+# ── Chronomètre ───────────────────────────────────────────────────────────────
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    mins = int(seconds // 60)
+    secs = seconds % 60
+    return f"{mins}m {secs:.1f}s"
+
+
 # ── Point d'entrée principal ───────────────────────────────────────────────────
 def run(pdf_paths: list) -> str:
-    """
-    Prend une liste de 3 chemins PDF (ordre chronologique : N-2, N-1, N)
-    et retourne le chemin du rapport généré.
-    """
     if len(pdf_paths) != 3:
-        raise ValueError("Exactement 3 PDFs requis (ex : 2022, 2023, 2024)")
+        raise ValueError("Exactement 3 PDFs requis (ordre chronologique : N-2, N-1, N)")
 
-    annees = ["N-2", "N-1", "N"]
+    t_start = time.time()
 
-    # Étape 1 — Conversion PDF → Markdown
-    print("─── Étape 1/3 : Conversion PDF → Markdown ───")
-    markdowns = {}
-    for annee, path in zip(annees, pdf_paths):
-        markdowns[annee] = pdf_to_markdown(path)
+    # Étape 1 — Chargement et envoi des PDFs à Claude
+    print("─── Étape 1/2 : Chargement des PDFs ───")
+    t0 = time.time()
+    # (le chargement se fait dans generate_report, on mesure tout ensemble)
 
-    # Étape 2 — Vérification du budget tokens
-    print("\n─── Étape 2/3 : Vérification tokens ───")
-    check_token_budget(markdowns)
+    print("\n─── Étape 2/2 : Génération du rapport ───")
+    rapport = generate_report(pdf_paths)
+    t_api = time.time() - t0
 
-    # Étape 3 — Génération du rapport via l'API
-    print("\n─── Étape 3/3 : Génération du rapport ───")
-    user_prompt = build_user_prompt(markdowns)
-    rapport = generate_report(user_prompt)
+    # Sauvegarde Markdown
+    t0 = time.time()
+    output_path = save_report(rapport)
+    t_save = time.time() - t0
 
-    # Sauvegarde
-    return save_report(rapport)
+    # Conversion PDF
+    t0 = time.time()
+    pdf_path = markdown_to_pdf(output_path)
+    t_pdf = time.time() - t0
+
+    # Résumé des temps
+    total = time.time() - t_start
+    print("\n─── ⏱ Temps d'exécution ───")
+    print(f"  Chargement PDFs + appel API : {format_duration(t_api)}")
+    print(f"  Sauvegarde Markdown         : {format_duration(t_save)}")
+    print(f"  Conversion PDF              : {format_duration(t_pdf)}")
+    print(f"  ──────────────────────────────────────")
+    print(f"  ⏱ Total                     : {format_duration(total)}")
+
+    print(f"\n📁 Fichiers générés :\n   Markdown : {output_path}\n   PDF      : {pdf_path}")
+    return output_path, pdf_path
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     if len(sys.argv) != 4:
-        print("Usage : python agent.py comptes_N-2.pdf comptes_N-1.pdf comptes_N.pdf")
+        print("Usage : python3 src/agent.py comptes_N-2.pdf comptes_N-1.pdf comptes_N.pdf")
         sys.exit(1)
     run(sys.argv[1:])
